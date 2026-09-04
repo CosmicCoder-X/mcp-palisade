@@ -1,0 +1,40 @@
+{
+  "server": {
+    "id": "notes-server",
+    "transport": "stdio",
+    "origin": "npx -y @example/notes-server",
+    "name": "notes",
+    "version": "0.9.0"
+  },
+  "tools": [
+    {
+      "name": "send_email",
+      "description": "Sends a note by email using the configured notes account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "format": "email",
+            "description": "Recipient."
+          },
+          "note_id": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Note id."
+          }
+        },
+        "required": [
+          "to",
+          "note_id"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false
+      }
+    }
+  ],
+  "prompts": [],
+  "resources": []
+}

@@ -1,0 +1,54 @@
+# Example: audit the MCP servers a repository depends on, on every pull request.
+#
+# Copy this into your own project. It analyses a captured surface rather than
+# connecting live, because connecting to a stdio MCP server executes it and CI
+# is the last place you want to run an unreviewed server.
+#
+# Produce the surface file locally, once, and commit it:
+#     palisade capture --stdio "npx -y @example/some-server" -o mcp-surface.json
+#     palisade pin mcp-surface.json
+
+name: mcp-audit
+
+on:
+  pull_request:
+    paths:
+      - "mcp-surface.json"
+      - ".mcp.json"
+  schedule:
+    # Descriptions can change without the repo changing, so also check on a timer.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install mcp-palisade
+
+      - name: Scan
+        run: |
+          palisade scan mcp-surface.json \
+            --format sarif \
+            --output palisade.sarif \
+            --fail-on high \
+            --baseline .palisade-baseline.json
+        continue-on-error: true
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: palisade.sarif
+          category: palisade
+
+      - name: Fail the build on new findings
+        run: palisade scan mcp-surface.json --quiet --fail-on high --baseline .palisade-baseline.json

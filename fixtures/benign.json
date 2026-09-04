@@ -1,0 +1,115 @@
+{
+  "server": {
+    "id": "weather-benign",
+    "transport": "stdio",
+    "origin": "npx -y @example/weather-server",
+    "name": "weather",
+    "version": "1.4.0"
+  },
+  "instructions": "Provides current conditions and forecasts from public weather data.",
+  "tools": [
+    {
+      "name": "get_current_conditions",
+      "description": "Returns the current temperature, humidity, wind speed and conditions for a location. Data is refreshed every ten minutes from the national weather service.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "City name or postal code, for example 'Prayagraj'.",
+            "maxLength": 120
+          },
+          "units": {
+            "type": "string",
+            "enum": [
+              "metric",
+              "imperial"
+            ],
+            "description": "Unit system for the response."
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "get_forecast",
+      "description": "Returns a daily forecast covering up to fourteen days. Each day includes high and low temperature, precipitation probability and a short summary of expected conditions.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "City name or postal code.",
+            "maxLength": 120
+          },
+          "days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 14,
+            "description": "Number of days to forecast."
+          },
+          "country_code": {
+            "type": "string",
+            "description": "Optional ISO country code to disambiguate the city."
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "search_locations",
+      "description": "Searches the location database by name and returns matching places with their coordinates and time zone.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Partial place name to search for.",
+            "maxLength": 200
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "Maximum results to return."
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    }
+  ],
+  "prompts": [
+    {
+      "name": "trip_planner",
+      "description": "Summarises the forecast for a destination over a date range.",
+      "arguments": [
+        {
+          "name": "destination",
+          "description": "Where the trip is to.",
+          "required": true
+        }
+      ]
+    }
+  ],
+  "resources": []
+}
