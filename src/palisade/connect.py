@@ -115,7 +115,10 @@ def _require_sdk() -> None:
 async def _collect(session: Any, spec: ServerSpec) -> ServerSurface:
     init = await session.initialize()
 
-    server_info = getattr(init, "serverInfo", None)
+    # The wire format is camelCase but the Python SDK exposes snake_case
+    # attributes, and which one a given version presents has changed. Accept
+    # either rather than silently recording a nameless server.
+    server_info = getattr(init, "server_info", None) or getattr(init, "serverInfo", None)
     instructions = getattr(init, "instructions", "") or ""
 
     surface = ServerSurface(

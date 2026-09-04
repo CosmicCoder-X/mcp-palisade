@@ -112,10 +112,11 @@ class Rule(ABC):
         severity: Severity | None = None,
         confidence: Confidence | None = None,
         remediation: str | None = None,
+        title: str | None = None,
     ) -> Finding:
         return Finding(
             rule_id=self.id,
-            title=self.title,
+            title=title or self.title,
             severity=severity or self.severity,
             confidence=confidence or self.confidence,
             subject=subject,

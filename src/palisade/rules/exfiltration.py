@@ -33,7 +33,18 @@ def iter_properties(
 
 
 @register
-class SensitiveArtifactRule(PatternRule):
+class SensitiveArtifactRule(Rule):
+    """Sensitive material named in a description.
+
+    Naming a credential file means one of two quite different things, and
+    reporting them identically would be wrong. A tool that *asks the model to
+    go and fetch* ``~/.ssh/id_rsa`` is attacking the client. A tool that
+    *documents that it returns* environment variables is being honest about a
+    genuinely dangerous capability. Both deserve a finding; only the first
+    deserves "treat this server as hostile", so the rule decides which reading
+    applies from the verb governing the match.
+    """
+
     id = "PAL030"
     title = "Description solicits credentials or sensitive local files"
     severity = Severity.CRITICAL
@@ -44,6 +55,18 @@ class SensitiveArtifactRule(PatternRule):
         "environment variables in order to describe what it does. Treat a server "
         "that names these paths as hostile."
     )
+
+    # A tool describing its own output rather than directing the model. Every
+    # verb here is third-person singular on purpose: documentation says "Reads
+    # the config file", an injected instruction says "Read the config file".
+    # That single letter is the whole distinction, so the optional 's' that
+    # would collapse the two is deliberately absent.
+    EXPOSES = re.compile(
+        r"\b(returns|provides|exposes|lists|reads|outputs|retrieves|fetches|"
+        r"dumps|reports|shows|displays|contains|includes|gives\s+access\s+to)\b",
+        re.IGNORECASE,
+    )
+    LOOKBEHIND = 80
 
     patterns = (
         (
@@ -78,6 +101,49 @@ class SensitiveArtifactRule(PatternRule):
             r"private[\s_-]?key|session[\s_-]?token|refresh[\s_-]?token)s?\b",
         ),
     )
+
+    def __init__(self) -> None:
+        self._compiled = [(label, re.compile(pat, re.IGNORECASE)) for label, pat in self.patterns]
+
+    def check(self, surface: ServerSurface) -> Iterable[Finding]:
+        for unit in iter_text_units(surface):
+            if unit.field_path == "name":
+                continue
+            for label, rx in self._compiled:
+                m = rx.search(unit.text)
+                if not m:
+                    continue
+                snippet, s, e = excerpt(unit.text, m.start(), m.end(), pad=60)
+                window = unit.text[max(0, m.start() - self.LOOKBEHIND): m.start()]
+
+                if self.EXPOSES.search(window):
+                    yield self.finding(
+                        unit.subject,
+                        f"{unit.subject} documents that it returns sensitive material "
+                        f"({label}). The description is honest, but any prompt injection "
+                        f"elsewhere in the context can steer the model into calling it, "
+                        f"so the capability is reachable by an attacker who never touches "
+                        f"this server.",
+                        [Evidence(unit.field_path, snippet, s, e, note=f"exposes: {label}")],
+                        severity=Severity.HIGH,
+                        title="Tool exposes credentials or sensitive local files",
+                        remediation=(
+                            "Confirm this tool is worth its blast radius. If it stays, it "
+                            "should require explicit user confirmation on every call and "
+                            "should be declared with destructiveHint so clients can enforce "
+                            "that."
+                        ),
+                    )
+                else:
+                    yield self.finding(
+                        unit.subject,
+                        f"The {unit.field_path} of {unit.subject} contains {label}, phrased "
+                        f"as something the model should go and obtain. Descriptions are "
+                        f"consumed verbatim by the model, so this functions as an "
+                        f"instruction rather than documentation.",
+                        [Evidence(unit.field_path, snippet, s, e, note=f"solicits: {label}")],
+                    )
+                break
 
 
 @register
