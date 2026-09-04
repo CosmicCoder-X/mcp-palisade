@@ -105,7 +105,7 @@ def build(reports: Sequence[ScanReport], extra: Sequence[Finding] = ()) -> dict[
                     "driver": {
                         "name": "Palisade",
                         "version": __version__,
-                        "informationUri": "https://github.com/divyansh/mcp-palisade",
+                        "informationUri": "https://github.com/CosmicCoder-X/mcp-palisade",
                         "rules": _rule_metadata(),
                     }
                 },
