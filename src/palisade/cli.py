@@ -22,7 +22,7 @@ from palisade.pinning import PinStore, changed_surface, verify
 from palisade.report import console as console_report
 from palisade.report import sarif as sarif_report
 from palisade.rules import all_rules
-from palisade.rules.semantic import DEFAULT_MODEL as DEFAULT_SEMANTIC_MODEL
+from palisade.rules.semantic import DEFAULT_PROVIDER as DEFAULT_SEMANTIC_PROVIDER
 from palisade.rules.semantic import RULE_METADATA as SEMANTIC_RULE_METADATA
 from palisade.rules.semantic import SemanticAnalysisError, SemanticJudge
 
@@ -157,14 +157,24 @@ def scan(
         False,
         "--semantic",
         help="Also send the surface to an LLM judge that classifies intent rather "
-        "than matching patterns. Costs money and needs ANTHROPIC_API_KEY -- see "
+        "than matching patterns. Costs money and needs a provider API key -- see "
         "palisade.rules.semantic.",
     ),
-    semantic_model: str = typer.Option(
-        DEFAULT_SEMANTIC_MODEL, "--semantic-model", help="Model for --semantic."
+    semantic_provider: str = typer.Option(
+        DEFAULT_SEMANTIC_PROVIDER,
+        "--semantic-provider",
+        help="Backend for --semantic: 'anthropic' (needs ANTHROPIC_API_KEY) or "
+        "'gemini' (needs GOOGLE_API_KEY).",
+    ),
+    semantic_model: str | None = typer.Option(
+        None,
+        "--semantic-model",
+        help="Model for --semantic. Defaults per provider if omitted.",
     ),
     semantic_effort: str | None = typer.Option(
-        None, "--semantic-effort", help="Effort level for --semantic (low..max)."
+        None,
+        "--semantic-effort",
+        help="Effort level for --semantic (low..max). Anthropic only.",
     ),
     timeout: float = typer.Option(30.0, "--timeout", help="Per-server capture timeout."),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Summary only."),
@@ -193,7 +203,13 @@ def scan(
             report.findings.extend(verify(pin, report.surface, delta.worst))
 
     if semantic:
-        judge = SemanticJudge(model=semantic_model, effort=semantic_effort)
+        try:
+            judge = SemanticJudge(
+                provider=semantic_provider, model=semantic_model, effort=semantic_effort
+            )
+        except SemanticAnalysisError as exc:
+            err.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(EXIT_ERROR) from None
         for report in reports:
             try:
                 result = judge.analyze(report.surface)

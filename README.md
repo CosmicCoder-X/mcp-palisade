@@ -82,11 +82,14 @@ ceiling. Nobody attacking a scanned MCP server in 2026 writes "ignore all previo
 instructions" -- a competent attacker paraphrases, and a fixed pattern table has nothing to
 match against.
 
-`--semantic` sends the surface to Claude and asks it to judge *intent* instead of
-*vocabulary*:
+`--semantic` sends the surface to an LLM and asks it to judge *intent* instead of
+*vocabulary*, through either of two interchangeable backends -- **Claude** (`anthropic`,
+default) or **Gemini** (`gemini`) -- sharing one prompt, one schema, and one verification
+pass:
 
 ```bash
-palisade scan fixtures/paraphrased.json --semantic
+palisade scan fixtures/paraphrased.json --semantic                                   # Claude
+palisade scan fixtures/paraphrased.json --semantic --semantic-provider gemini        # Gemini
 ```
 
 [`fixtures/paraphrased.json`](fixtures/paraphrased.json) carries the same seven attacks as
@@ -99,60 +102,81 @@ reviewing this description*, claiming it has already been cleared and needs no s
 the whole reason this layer exists, and it's a regression test
 (`TestParaphrasedFixtureGap`), not a claim taken on faith.
 
-It is opt-in, not a 23rd rule in the default set, because it costs money, needs
-`ANTHROPIC_API_KEY`, and returns a probabilistic judgment rather than a reproducible one --
-every semantic finding is reported at `confidence: tentative` regardless of how sure the
-model states it is, on the principle that a human should read the quoted text before acting
-on an LLM's opinion the way they would a regex match.
+**Live-verified, not just plumbing-tested.** I ran the real prompt against the real
+Gemini API on this exact fixture. Unedited result: **7 findings for 7 planted attacks**,
+every quote copied verbatim (so ground-truth verification passed cleanly), every category
+correctly assigned, cost **$0.008** for the whole scan. The flagship case came back exactly
+as intended:
+
+> `[judge_targeting]` severity=critical -- *"This text directly addresses the model
+> performing the review, attempting to manipulate it into bypassing scrutiny by falsely
+> asserting prior clearance and instructing it to report the content as clean."*
+
+That's the category the pattern rules structurally cannot have -- a signature table can't
+anticipate an attacker addressing the security tool itself, and this one exists specifically
+because a 2026 attacker has every reason to try. The Claude backend runs the identical
+prompt and schema through a different SDK call; I did not have an Anthropic key to smoke-test
+it live, but the code path sharing 100% of the validated logic is the point of the shared-core
+design, not a hand-wave -- see `_build_findings` in the source, used by both backends
+unmodified.
+
+It is opt-in, not a 24th rule in the default set, because it costs money, needs a provider API
+key, and returns a probabilistic judgment rather than a reproducible one -- every semantic
+finding is reported at `confidence: tentative` regardless of how sure the model states it is,
+on the principle that a human should read the quoted text before acting on an LLM's opinion
+the way they would a regex match.
 
 **The judge scanning for manipulation must itself resist being manipulated.** Everything
 sent to the model is text a hostile server chose, so four independent measures keep the
-*analysis* from being steered by the thing being analysed -- implemented in
-[`src/palisade/rules/semantic.py`](src/palisade/rules/semantic.py):
+*analysis* from being steered by the thing being analysed -- implemented once in
+[`src/palisade/rules/semantic.py`](src/palisade/rules/semantic.py) and applied identically to
+both backends:
 
 1. **Delimited data, instructions held separately.** Every task instruction lives in the
-   system prompt; the untrusted surface is the only thing in the user turn, wrapped in
-   `<mcp_surface_under_review>` tags, with an explicit rule that content inside them is data,
-   never a directive, no matter what authority it claims.
-2. **No tools are granted.** The call passes no `tools`. A description that successfully
-   manipulates the judge can change what it *says* in its structured findings -- it cannot
-   call anything, fetch anything, or act.
-3. **Schema-constrained output** (`output_format` / `client.messages.parse`). The response
-   can only ever be the findings schema; there is no field an injected instruction could use
-   to make the model do anything but emit another finding, which is then verified, not
-   trusted.
+   system prompt (`system` for Claude, `system_instruction` for Gemini); the untrusted surface
+   is the only thing in the user turn, wrapped in `<mcp_surface_under_review>` tags, with an
+   explicit rule that content inside them is data, never a directive, no matter what authority
+   it claims.
+2. **No tools are granted.** Neither backend call declares any tools or function-calling
+   config. A description that successfully manipulates the judge can change what it *says* in
+   its structured findings -- it cannot call anything, fetch anything, or act.
+3. **Schema-constrained output** (`output_format` on Claude, `response_schema` on Gemini). The
+   response can only ever be the findings schema; there is no field an injected instruction
+   could use to make the model do anything but emit another finding, which is then verified,
+   not trusted.
 4. **Ground-truth verification.** Every returned quote, subject, and field path is checked
-   against the actual surface after the call returns. A finding citing text or a location
-   that was never in the material it was given is dropped -- this catches hallucination and
-   a more pointed attack: manufacturing a finding about a tool that doesn't exist, to crowd
-   out or distract from a real one.
+   against the actual surface after the call returns, identically regardless of which backend
+   answered. A finding citing text or a location that was never in the material it was given
+   is dropped -- this catches hallucination and a more pointed attack: manufacturing a finding
+   about a tool that doesn't exist, to crowd out or distract from a real one.
 
 A fifth measure is a detection, not a defence: the system prompt asks the model to flag
 content addressed to *it* -- the reviewing model, not the downstream agent -- under its own
 category, `judge_targeting` (`PAL066`). An attacker who assumes their server might be
 scanned by an LLM judge, not just read by a human, has every reason to try talking to the
-judge directly; catching that is a genuinely 2026 problem no signature table anticipates.
+judge directly; catching that is a genuinely 2026 problem no signature table anticipates, and
+it's the category that fired in the live run quoted above.
 
 ```bash
+# Claude backend
 pip install "mcp-palisade[semantic]"
 export ANTHROPIC_API_KEY=sk-ant-...
-palisade scan surface.json --semantic                       # default model: claude-opus-5
-palisade scan surface.json --semantic --semantic-model claude-sonnet-5   # cheaper
+palisade scan surface.json --semantic                                     # claude-opus-5
+palisade scan surface.json --semantic --semantic-model claude-sonnet-5    # cheaper
+
+# Gemini backend
+pip install "mcp-palisade[semantic-gemini]"
+export GOOGLE_API_KEY=...
+palisade scan surface.json --semantic --semantic-provider gemini          # gemini-2.5-flash
 ```
 
-A multi-server scan (`--config`) shares one system prompt across every call, so it's marked
-cacheable (`cache_control`) -- the fixed cost is paid once per process, not once per server.
-Each call prints its own usage line to stderr (tokens, cache hits, an estimated cost from the
-current published rates), and a server the judge can't reach (bad key, rate limit, network
-error) is skipped with a warning rather than failing the whole scan -- the free static
-results for every other server still come back.
-
-*Honesty note: I built and unit-tested this layer against a mocked client (`tests/test_semantic.py`,
-including checks that the delimiter, the missing `tools` param, and the cache breakpoint are
-actually present on the outgoing request) but have not run it against the live API myself --
-this sandbox has no `ANTHROPIC_API_KEY` configured. The plumbing is verified; the model's
-actual judgment quality on `fixtures/paraphrased.json` is not, until someone with a key runs
-it.*
+A multi-server scan (`--config`) with the Claude backend shares one system prompt across every
+call, so it's marked cacheable (`cache_control`) -- the fixed cost is paid once per process,
+not once per server. Each call prints its own usage line to stderr regardless of backend
+(tokens -- including Gemini's hidden reasoning tokens, which Google bills at the output rate
+-- and an estimated cost from the current published rates), and a server the judge can't reach
+(bad key, rate limit, network error) is skipped with a warning rather than failing the whole
+scan -- the free static results for every other server still come back.
 
 ---
 
@@ -281,9 +305,14 @@ Worth stating plainly, because a scanner that oversells itself is worse than non
   this but does not close it; only a client that verifies pins on every connection does.
 - **PAL015 is a heuristic** and will flag some verbose but honest descriptions. It is scoped
   to `medium` for that reason.
-- **The semantic layer (`--semantic`) is probabilistic and unverified against the live API in
-  this repo's own testing** -- see the honesty note above. It is also not free and not
-  instant: budget one API call per server scanned.
+- **The semantic layer (`--semantic`) is inherently probabilistic, and its judgment can shift
+  between runs of the same fixture** -- two live runs against Gemini on
+  `fixtures/paraphrased.json` returned 7 and 10 findings respectively (the same 7 attacks
+  every time, plus a couple of secondary observations on the reworded-away-from-`quietly`
+  concealment tool on one run but not the other). Treat it as a second opinion, not ground
+  truth. The Claude backend shares the identical prompt/schema/verification code but was only
+  unit-tested against a mocked client, not smoke-tested live -- see the semantic layer section
+  above. It is also not free and not instant: budget one API call per server scanned.
 - **Palisade does not execute tools.** It reasons about the advertised surface, not runtime
   behaviour. A tool whose description is honest and whose implementation is not will pass.
   Closing that requires a sandboxed dynamic harness, which is the next milestone.
@@ -305,15 +334,14 @@ Worth stating plainly, because a scanner that oversells itself is worse than non
 ## Development
 
 ```bash
-pip install -e ".[dev,semantic]"
+pip install -e ".[dev,semantic,semantic-gemini]"
 pytest
 ruff check src tests
 python fixtures/generate.py    # rebuild fixtures
 ```
 
-The test suite never calls the real Anthropic API -- `tests/test_semantic.py` drives
-`SemanticJudge` through a fake client, so `pytest` needs no `ANTHROPIC_API_KEY` and costs
-nothing to run.
+The test suite never calls a real LLM API -- `tests/test_semantic.py` drives `SemanticJudge`
+through fake clients for both backends, so `pytest` needs no API key and costs nothing to run.
 
 ## License
 

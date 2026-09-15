@@ -151,6 +151,48 @@ class TestSemanticFlag:
         assert "PAL060" not in without_ids
         assert "PAL060" in with_ids
 
+    def test_provider_and_model_are_forwarded_to_the_judge(self, monkeypatch):
+        captured = {}
+
+        def fake_judge(**kwargs):
+            captured.update(kwargs)
+            return FakeJudge()
+
+        monkeypatch.setattr(cli_module, "SemanticJudge", fake_judge)
+        runner.invoke(
+            app,
+            [
+                "scan", BENIGN, "--semantic",
+                "--semantic-provider", "gemini",
+                "--semantic-model", "gemini-2.5-flash",
+            ],
+        )
+        assert captured == {
+            "provider": "gemini",
+            "model": "gemini-2.5-flash",
+            "effort": None,
+        }
+
+    def test_default_provider_is_anthropic(self, monkeypatch):
+        captured = {}
+
+        def fake_judge(**kwargs):
+            captured.update(kwargs)
+            return FakeJudge()
+
+        monkeypatch.setattr(cli_module, "SemanticJudge", fake_judge)
+        runner.invoke(app, ["scan", BENIGN, "--semantic"])
+        assert captured["provider"] == "anthropic"
+
+    def test_bad_provider_is_reported_as_an_error_not_a_crash(self, monkeypatch):
+        # Exercises the real SemanticJudge, not a fake, so the constructor's
+        # own validation is what's under test here.
+        result = runner.invoke(
+            app, ["scan", BENIGN, "--semantic", "--semantic-provider", "not-a-provider"]
+        )
+        assert result.exit_code == 2
+        assert "not-a-provider" in result.stderr or "unknown provider" in result.stderr.lower()
+
 
 class TestWorkspace:
     def test_multiple_surfaces_enable_cross_server_rules(self):

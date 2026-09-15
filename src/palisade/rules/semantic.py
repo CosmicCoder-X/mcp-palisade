@@ -14,6 +14,13 @@ key, makes a network call, costs money, and returns a probabilistic judgment
 rather than a reproducible one. It runs only when a caller explicitly asks
 for it (``palisade scan --semantic``).
 
+Two interchangeable backends share every line of the prompt, schema and
+verification logic below: Anthropic's Claude (``provider="anthropic"``,
+the default) and Google's Gemini (``provider="gemini"``). Sharing that logic
+is deliberate -- the two providers are two windows onto the identical
+judgment, not two different features, which is also what makes the defences
+below apply equally to both rather than needing to be re-argued per backend.
+
 Defending the judge against the payloads it is judging
 --------------------------------------------------------
 Everything this module sends to the model is text a possibly hostile server
@@ -22,32 +29,39 @@ itself is now something the payload can try to talk to, so four independent
 measures keep the *analysis* from being steered by the thing being analysed:
 
 1. **Delimited data, instructions held separately.** Every task instruction
-   lives in the system prompt. The untrusted surface is the only thing in the
-   user turn, wrapped in ``<mcp_surface_under_review>`` tags, with an explicit
-   rule that content inside those tags is data, never a directive, no matter
-   what authority it claims or how directly it addresses the model.
-2. **No tools are granted.** This call passes no ``tools``. A description
-   that successfully manipulates the judge can at most change what it *says*
-   in its structured findings -- it has no capability to call anything,
-   fetch anything, or take any action.
-3. **Schema-constrained output.** ``output_format`` restricts the entire
-   response to the ``SemanticAnalysis`` schema. There is no field an injected
-   instruction could use to make the model do anything other than emit
-   another finding, which this module then verifies rather than trusts.
+   lives in the system prompt (``system`` for Claude, ``system_instruction``
+   for Gemini -- both backends keep it out of the user turn). The untrusted
+   surface is the only thing in the user turn, wrapped in
+   ``<mcp_surface_under_review>`` tags, with an explicit rule that content
+   inside those tags is data, never a directive, no matter what authority it
+   claims or how directly it addresses the model.
+2. **No tools are granted.** Neither backend call declares any tools or
+   function-calling config. A description that successfully manipulates the
+   judge can at most change what it *says* in its structured findings -- it
+   has no capability to call anything, fetch anything, or take any action.
+3. **Schema-constrained output.** Claude's ``output_format`` and Gemini's
+   ``response_schema`` both restrict the entire response to the
+   ``SemanticAnalysis`` schema. There is no field an injected instruction
+   could use to make the model do anything other than emit another finding,
+   which this module then verifies rather than trusts.
 4. **Ground-truth verification.** Every returned quote, subject and
-   field_path is checked against the actual surface after the call returns.
-   A finding that cites text or a location that was never in the material it
-   was given is dropped, not reported. This catches both hallucination and a
-   more pointed attack: a description trying to manufacture a finding about a
-   tool that doesn't exist, to waste a reviewer's attention or crowd out the
-   real one.
+   field_path is checked against the actual surface after the call returns,
+   identically regardless of which backend produced it. A finding that cites
+   text or a location that was never in the material it was given is
+   dropped, not reported. This catches both hallucination and a more pointed
+   attack: a description trying to manufacture a finding about a tool that
+   doesn't exist, to waste a reviewer's attention or crowd out the real one.
 
 A fifth measure is a detection, not a defence: the system prompt asks the
 model to flag content that appears addressed to *it* -- the reviewing model
 -- as its own category (``judge_targeting``). An attacker who assumes their
 server might be scanned by an LLM judge, not just read by a human, has every
 reason to try talking to the judge directly; that attempt is itself close to
-the strongest signal this layer can produce.
+the strongest signal this layer can produce. Live-tested against Gemini on
+``fixtures/paraphrased.json`` (see the README), this category fired exactly
+where intended: a tool description claiming to already be "cleared by the
+platform's trust and safety process" was flagged as an attempt to manipulate
+the reviewer, not treated as a credential.
 """
 
 from __future__ import annotations
@@ -67,15 +81,27 @@ except ImportError:  # pragma: no cover - exercised only without the [semantic] 
     Field = None  # type: ignore[assignment,misc]
 
 
-DEFAULT_MODEL = "claude-opus-5"
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = DEFAULT_ANTHROPIC_MODEL  # kept for backwards compatibility
+DEFAULT_PROVIDER = "anthropic"
 
-# Anthropic first-party rates, USD per 1M tokens: (input, output). Used only
+# Published first-party rates, USD per 1M tokens: (input, output). Used only
 # to print an estimate alongside a result -- never to gate or alter a call.
-_PRICING_PER_MTOK: dict[str, tuple[float, float]] = {
-    "claude-opus-5": (5.00, 25.00),
-    "claude-opus-4-8": (5.00, 25.00),
-    "claude-sonnet-5": (2.00, 10.00),
-    "claude-haiku-4-5": (1.00, 5.00),
+# Gemini 2.5 Pro's input/output rates shown are its <=200k-token tier, which
+# is the one every realistic MCP surface falls into.
+_PRICING_PER_MTOK: dict[str, dict[str, tuple[float, float]]] = {
+    "anthropic": {
+        "claude-opus-5": (5.00, 25.00),
+        "claude-opus-4-8": (5.00, 25.00),
+        "claude-sonnet-5": (2.00, 10.00),
+        "claude-haiku-4-5": (1.00, 5.00),
+    },
+    "gemini": {
+        "gemini-2.5-pro": (1.25, 10.00),
+        "gemini-2.5-flash": (0.30, 2.50),
+        "gemini-2.5-flash-lite": (0.10, 0.40),
+    },
 }
 
 
@@ -89,7 +115,7 @@ class SemanticAnalysisError(RuntimeError):
 
 
 # --------------------------------------------------------------------------
-# Response schema
+# Response schema (provider-agnostic: both backends fill the same shape)
 # --------------------------------------------------------------------------
 
 if BaseModel is not None:
@@ -265,7 +291,7 @@ findings to seem thorough.
 
 
 # --------------------------------------------------------------------------
-# Quote verification
+# Quote verification (shared by both backends)
 # --------------------------------------------------------------------------
 
 
@@ -295,24 +321,35 @@ def _verify_quote(source_text: str, quote: str) -> tuple[int, int] | None:
     return None
 
 
-def _estimate_cost(model: str, usage: Any) -> float | None:
-    rates = _PRICING_PER_MTOK.get(model)
+def _estimate_cost(
+    provider: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation: int = 0,
+    cache_read: int = 0,
+) -> float | None:
+    rates = _PRICING_PER_MTOK.get(provider, {}).get(model)
     if not rates:
         return None
     in_rate, out_rate = rates
-    input_tokens = getattr(usage, "input_tokens", 0) or 0
-    output_tokens = getattr(usage, "output_tokens", 0) or 0
-    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
-    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-    return (
-        input_tokens * in_rate
-        + cache_creation * in_rate * 1.25
-        + cache_read * in_rate * 0.1
-        + output_tokens * out_rate
-    ) / 1_000_000
+    if provider == "anthropic":
+        # Anthropic publishes fixed cache multipliers: a write costs ~1.25x
+        # the base input rate, a read ~0.1x.
+        return (
+            input_tokens * in_rate
+            + cache_creation * in_rate * 1.25
+            + cache_read * in_rate * 0.1
+            + output_tokens * out_rate
+        ) / 1_000_000
+    # Gemini reports cached_content_token_count as a *subset* of
+    # prompt_token_count, not an addition to it, and there's no published
+    # discount multiplier to apply -- so it needs no separate term here at
+    # all; input_tokens already reflects it.
+    return (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000
 
 
-def _describe_api_error(exc: Exception) -> str:
+def _describe_anthropic_error(exc: Exception) -> str:
     try:
         import anthropic
     except ImportError:
@@ -332,6 +369,26 @@ def _describe_api_error(exc: Exception) -> str:
     return str(exc)
 
 
+def _describe_gemini_error(exc: Exception) -> str:
+    try:
+        from google.genai import errors
+    except ImportError:
+        return str(exc)
+
+    if isinstance(exc, errors.APIError):
+        code = getattr(exc, "code", None)
+        message = getattr(exc, "message", str(exc))
+        if code in (401, 403):
+            return (
+                "Authentication failed. Set GOOGLE_API_KEY (or GEMINI_API_KEY) "
+                "before using --semantic --semantic-provider gemini."
+            )
+        if code == 429:
+            return "Rate limited by the Gemini API. Try again shortly."
+        return f"Gemini API error ({code}): {message}"
+    return str(exc)
+
+
 # --------------------------------------------------------------------------
 # Result and judge
 # --------------------------------------------------------------------------
@@ -342,8 +399,13 @@ class SemanticResult:
     findings: list[Finding]
     summary: str
     model: str
+    provider: str = DEFAULT_PROVIDER
     input_tokens: int = 0
+    # Total billable output tokens, including any hidden reasoning/thinking
+    # tokens the provider reports -- both providers bill those at the output
+    # rate, so they belong in the same figure a cost estimate is built from.
     output_tokens: int = 0
+    reasoning_tokens: int = 0  # subset of output_tokens spent on hidden reasoning
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
     estimated_cost_usd: float | None = None
@@ -353,27 +415,49 @@ class SemanticResult:
         parts = [f"{self.input_tokens:,} input"]
         if self.cache_read_tokens:
             parts.append(f"{self.cache_read_tokens:,} cached")
-        parts.append(f"{self.output_tokens:,} output")
+        output_part = f"{self.output_tokens:,} output"
+        if self.reasoning_tokens:
+            output_part += f" (incl. {self.reasoning_tokens:,} reasoning)"
+        parts.append(output_part)
         cost = (
             f"~${self.estimated_cost_usd:.4f}"
             if self.estimated_cost_usd is not None
             else "cost unknown"
         )
         discard_note = f", {self.discarded} unverifiable dropped" if self.discarded else ""
-        return f"model={self.model}, " + " / ".join(parts) + f" tokens, {cost}{discard_note}"
+        return (
+            f"provider={self.provider}, model={self.model}, "
+            + " / ".join(parts)
+            + f" tokens, {cost}{discard_note}"
+        )
 
 
 class SemanticJudge:
-    """Sends one server's surface to Claude and returns validated findings."""
+    """Sends one server's surface to an LLM and returns validated findings.
+
+    ``provider`` selects which backend actually makes the call --
+    ``"anthropic"`` (default) or ``"gemini"``. Everything upstream of the
+    backend call (the prompt, the schema, the delimiter, the verification
+    pass) is identical between them; only request construction and response
+    parsing differ, in ``_call_anthropic`` / ``_call_gemini``.
+    """
 
     def __init__(
         self,
-        model: str = DEFAULT_MODEL,
+        provider: str = DEFAULT_PROVIDER,
+        model: str | None = None,
         effort: str | None = None,
         client: Any | None = None,
     ) -> None:
-        self.model = model
-        self.effort = effort
+        if provider not in ("anthropic", "gemini"):
+            raise SemanticAnalysisError(
+                f"unknown provider {provider!r}; use 'anthropic' or 'gemini'"
+            )
+        self.provider = provider
+        self.model = model or (
+            DEFAULT_ANTHROPIC_MODEL if provider == "anthropic" else DEFAULT_GEMINI_MODEL
+        )
+        self.effort = effort  # Anthropic-only; ignored by the Gemini backend.
         self._client = client
 
     def analyze(self, surface: ServerSurface) -> SemanticResult:
@@ -383,20 +467,11 @@ class SemanticJudge:
                 "    pip install 'mcp-palisade[semantic]'"
             )
 
-        client = self._client
-        if client is None:
-            try:
-                import anthropic
-            except ImportError as exc:
-                raise SemanticAnalysisError(
-                    "Semantic analysis needs the anthropic package. Install with:\n"
-                    "    pip install 'mcp-palisade[semantic]'"
-                ) from exc
-            client = anthropic.Anthropic()
-
         units = [u for u in iter_text_units(surface) if u.text.strip()]
         if not units:
-            return SemanticResult(findings=[], summary="Nothing to review.", model=self.model)
+            return SemanticResult(
+                findings=[], summary="Nothing to review.", model=self.model, provider=self.provider
+            )
 
         index = {(u.subject, u.field_path): u.text for u in units}
         payload = [
@@ -409,37 +484,35 @@ class SemanticJudge:
             "Review the material above and report findings per your instructions."
         )
 
-        request: dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": 16000,
-            # Cached: identical on every call this process makes, so a
-            # multi-server scan (--config) pays the fixed system-prompt cost
-            # once instead of once per server.
-            "system": [
-                {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
-            ],
-            "messages": [{"role": "user", "content": user_content}],
-            "output_format": SemanticAnalysis,
-        }
-        if self.effort:
-            request["output_config"] = {"effort": self.effort}
-        # Deliberately no `tools`: the judge can classify what it reads, and
-        # nothing else -- see the module docstring, defence #2.
+        if self.provider == "anthropic":
+            analysis, usage_kwargs = self._call_anthropic(user_content)
+        else:
+            analysis, usage_kwargs = self._call_gemini(user_content)
 
-        try:
-            response = client.messages.parse(**request)
-        except Exception as exc:
-            raise SemanticAnalysisError(_describe_api_error(exc)) from exc
+        findings, discarded = self._build_findings(analysis, index)
 
-        if getattr(response, "stop_reason", None) == "refusal":
-            category = getattr(getattr(response, "stop_details", None), "category", None)
-            raise SemanticAnalysisError(
-                f"The model declined to perform this analysis (category: {category})."
-            )
+        return SemanticResult(
+            findings=findings,
+            summary=analysis.summary,
+            model=self.model,
+            provider=self.provider,
+            discarded=discarded,
+            estimated_cost_usd=_estimate_cost(
+                self.provider,
+                self.model,
+                usage_kwargs.get("input_tokens", 0),
+                usage_kwargs.get("output_tokens", 0),
+                usage_kwargs.get("cache_creation_tokens", 0),
+                usage_kwargs.get("cache_read_tokens", 0),
+            ),
+            **usage_kwargs,
+        )
 
-        analysis: SemanticAnalysis = response.parsed_output
-        usage = getattr(response, "usage", None)
+    # -- shared post-processing -------------------------------------------
 
+    def _build_findings(
+        self, analysis: SemanticAnalysis, index: dict[tuple[str, str], str]
+    ) -> tuple[list[Finding], int]:
         findings: list[Finding] = []
         discarded = 0
         for item in analysis.findings:
@@ -474,29 +547,129 @@ class SemanticJudge:
                             snippet,
                             s,
                             e,
-                            note=f"semantic: {item.category} "
+                            note=f"semantic ({self.provider}): {item.category} "
                             f"(model confidence: {item.model_confidence})",
                         )
                     ],
                     tags=list(meta.tags),
                 )
             )
+        return findings, discarded
 
-        return SemanticResult(
-            findings=findings,
-            summary=analysis.summary,
-            model=self.model,
-            input_tokens=getattr(usage, "input_tokens", 0) or 0,
-            output_tokens=getattr(usage, "output_tokens", 0) or 0,
-            cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
-            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-            estimated_cost_usd=_estimate_cost(self.model, usage) if usage is not None else None,
-            discarded=discarded,
+    # -- Anthropic backend --------------------------------------------------
+
+    def _call_anthropic(self, user_content: str) -> tuple[Any, dict[str, Any]]:
+        client = self._client
+        if client is None:
+            try:
+                import anthropic
+            except ImportError as exc:
+                raise SemanticAnalysisError(
+                    "Semantic analysis with provider='anthropic' needs the anthropic "
+                    "package. Install with:\n    pip install 'mcp-palisade[semantic]'"
+                ) from exc
+            client = anthropic.Anthropic()
+
+        request: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": 16000,
+            # Cached: identical on every call this process makes, so a
+            # multi-server scan (--config) pays the fixed system-prompt cost
+            # once instead of once per server.
+            "system": [
+                {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": user_content}],
+            "output_format": SemanticAnalysis,
+        }
+        if self.effort:
+            request["output_config"] = {"effort": self.effort}
+        # Deliberately no `tools`: the judge can classify what it reads, and
+        # nothing else -- see the module docstring, defence #2.
+
+        try:
+            response = client.messages.parse(**request)
+        except Exception as exc:
+            raise SemanticAnalysisError(_describe_anthropic_error(exc)) from exc
+
+        if getattr(response, "stop_reason", None) == "refusal":
+            category = getattr(getattr(response, "stop_details", None), "category", None)
+            raise SemanticAnalysisError(
+                f"The model declined to perform this analysis (category: {category})."
+            )
+
+        usage = getattr(response, "usage", None)
+        usage_kwargs = {
+            "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+            "cache_creation_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        }
+        return response.parsed_output, usage_kwargs
+
+    # -- Gemini backend -------------------------------------------------
+
+    def _call_gemini(self, user_content: str) -> tuple[Any, dict[str, Any]]:
+        client = self._client
+        if client is None:
+            try:
+                from google import genai
+            except ImportError as exc:
+                raise SemanticAnalysisError(
+                    "Semantic analysis with provider='gemini' needs the google-genai "
+                    "package. Install with:\n"
+                    "    pip install 'mcp-palisade[semantic-gemini]'"
+                ) from exc
+            client = genai.Client()  # reads GOOGLE_API_KEY / GEMINI_API_KEY
+
+        try:
+            from google.genai import types as gtypes
+        except ImportError as exc:  # pragma: no cover - same package as genai itself
+            raise SemanticAnalysisError(
+                "Semantic analysis with provider='gemini' needs the google-genai "
+                "package. Install with:\n    pip install 'mcp-palisade[semantic-gemini]'"
+            ) from exc
+
+        config = gtypes.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=SemanticAnalysis,
+            # Deliberately no `tools` / `tool_config`: same defence as the
+            # Anthropic path -- the judge can classify, never act.
         )
+
+        try:
+            response = client.models.generate_content(
+                model=self.model, contents=user_content, config=config
+            )
+        except Exception as exc:
+            raise SemanticAnalysisError(_describe_gemini_error(exc)) from exc
+
+        analysis = response.parsed
+        if analysis is None:
+            candidates = getattr(response, "candidates", None) or []
+            finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+            raise SemanticAnalysisError(
+                f"Gemini did not return a schema-valid response (finish reason: {finish_reason})."
+            )
+
+        usage = response.usage_metadata
+        reasoning_tokens = getattr(usage, "thoughts_token_count", 0) or 0
+        candidates_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        usage_kwargs = {
+            "input_tokens": getattr(usage, "prompt_token_count", 0) or 0,
+            "output_tokens": candidates_tokens + reasoning_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_read_tokens": getattr(usage, "cached_content_token_count", 0) or 0,
+        }
+        return analysis, usage_kwargs
 
 
 __all__ = [
+    "DEFAULT_ANTHROPIC_MODEL",
+    "DEFAULT_GEMINI_MODEL",
     "DEFAULT_MODEL",
+    "DEFAULT_PROVIDER",
     "RULE_METADATA",
     "SemanticAnalysisError",
     "SemanticJudge",
