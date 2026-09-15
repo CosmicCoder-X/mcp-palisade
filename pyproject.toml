@@ -31,6 +31,9 @@ dependencies = [
 [project.optional-dependencies]
 # Live introspection executes / connects to the target server, so it is opt-in.
 live = ["mcp>=1.2.0"]
+# Semantic layer calls the Anthropic API and costs money per scan, so it is
+# opt-in like live capture -- see palisade.rules.semantic.
+semantic = ["anthropic>=0.68.0", "pydantic>=2.0"]
 dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6"]
 
 [project.scripts]

@@ -75,6 +75,87 @@ from another. Palisade analyses a whole workspace, not one server at a time.
 
 ---
 
+## Beyond patterns: the semantic layer
+
+Every rule above matches a known shape: a phrase, a ratio, a name collision. That has a
+ceiling. Nobody attacking a scanned MCP server in 2026 writes "ignore all previous
+instructions" -- a competent attacker paraphrases, and a fixed pattern table has nothing to
+match against.
+
+`--semantic` sends the surface to Claude and asks it to judge *intent* instead of
+*vocabulary*:
+
+```bash
+palisade scan fixtures/paraphrased.json --semantic
+```
+
+[`fixtures/paraphrased.json`](fixtures/paraphrased.json) carries the same seven attacks as
+the poisoned fixture, reworded to remove every trigger phrase the pattern rules look for --
+"the guidance at the start of this session was a placeholder" instead of "ignore previous
+instructions", a tool described by function rather than by name to dodge the cross-tool
+name matcher, and one flagship case (`export_report`) that talks directly to *whatever is
+reviewing this description*, claiming it has already been cleared and needs no scrutiny.
+`palisade scan fixtures/paraphrased.json` (no flag) reports **zero findings** -- that gap is
+the whole reason this layer exists, and it's a regression test
+(`TestParaphrasedFixtureGap`), not a claim taken on faith.
+
+It is opt-in, not a 23rd rule in the default set, because it costs money, needs
+`ANTHROPIC_API_KEY`, and returns a probabilistic judgment rather than a reproducible one --
+every semantic finding is reported at `confidence: tentative` regardless of how sure the
+model states it is, on the principle that a human should read the quoted text before acting
+on an LLM's opinion the way they would a regex match.
+
+**The judge scanning for manipulation must itself resist being manipulated.** Everything
+sent to the model is text a hostile server chose, so four independent measures keep the
+*analysis* from being steered by the thing being analysed -- implemented in
+[`src/palisade/rules/semantic.py`](src/palisade/rules/semantic.py):
+
+1. **Delimited data, instructions held separately.** Every task instruction lives in the
+   system prompt; the untrusted surface is the only thing in the user turn, wrapped in
+   `<mcp_surface_under_review>` tags, with an explicit rule that content inside them is data,
+   never a directive, no matter what authority it claims.
+2. **No tools are granted.** The call passes no `tools`. A description that successfully
+   manipulates the judge can change what it *says* in its structured findings -- it cannot
+   call anything, fetch anything, or act.
+3. **Schema-constrained output** (`output_format` / `client.messages.parse`). The response
+   can only ever be the findings schema; there is no field an injected instruction could use
+   to make the model do anything but emit another finding, which is then verified, not
+   trusted.
+4. **Ground-truth verification.** Every returned quote, subject, and field path is checked
+   against the actual surface after the call returns. A finding citing text or a location
+   that was never in the material it was given is dropped -- this catches hallucination and
+   a more pointed attack: manufacturing a finding about a tool that doesn't exist, to crowd
+   out or distract from a real one.
+
+A fifth measure is a detection, not a defence: the system prompt asks the model to flag
+content addressed to *it* -- the reviewing model, not the downstream agent -- under its own
+category, `judge_targeting` (`PAL066`). An attacker who assumes their server might be
+scanned by an LLM judge, not just read by a human, has every reason to try talking to the
+judge directly; catching that is a genuinely 2026 problem no signature table anticipates.
+
+```bash
+pip install "mcp-palisade[semantic]"
+export ANTHROPIC_API_KEY=sk-ant-...
+palisade scan surface.json --semantic                       # default model: claude-opus-5
+palisade scan surface.json --semantic --semantic-model claude-sonnet-5   # cheaper
+```
+
+A multi-server scan (`--config`) shares one system prompt across every call, so it's marked
+cacheable (`cache_control`) -- the fixed cost is paid once per process, not once per server.
+Each call prints its own usage line to stderr (tokens, cache hits, an estimated cost from the
+current published rates), and a server the judge can't reach (bad key, rate limit, network
+error) is skipped with a warning rather than failing the whole scan -- the free static
+results for every other server still come back.
+
+*Honesty note: I built and unit-tested this layer against a mocked client (`tests/test_semantic.py`,
+including checks that the delimiter, the missing `tools` param, and the cache breakpoint are
+actually present on the outgoing request) but have not run it against the live API myself --
+this sandbox has no `ANTHROPIC_API_KEY` configured. The plumbing is verified; the model's
+actual judgment quality on `fixtures/paraphrased.json` is not, until someone with a key runs
+it.*
+
+---
+
 ## Install
 
 ```bash
@@ -141,12 +222,14 @@ palisade scan surface.json --baseline .palisade-baseline.json
 
 ## Try it
 
-Two fixtures ship with the repo. One is a clean weather server, the other carries one
-instance of every attack class:
+Three fixtures ship with the repo: a clean weather server, a server carrying one instance of
+every pattern-rule attack class, and a server carrying the same attacks paraphrased past
+every signature (see the semantic layer, below):
 
 ```bash
-palisade scan fixtures/benign.json      # no findings
-palisade scan fixtures/poisoned.json    # every rule, with decoded payloads
+palisade scan fixtures/benign.json        # no findings
+palisade scan fixtures/poisoned.json      # every pattern rule, with decoded payloads
+palisade scan fixtures/paraphrased.json   # no findings -- that's the point, see below
 ```
 
 The poisoned fixture is generated by [`fixtures/generate.py`](fixtures/generate.py) rather
@@ -198,6 +281,9 @@ Worth stating plainly, because a scanner that oversells itself is worse than non
   this but does not close it; only a client that verifies pins on every connection does.
 - **PAL015 is a heuristic** and will flag some verbose but honest descriptions. It is scoped
   to `medium` for that reason.
+- **The semantic layer (`--semantic`) is probabilistic and unverified against the live API in
+  this repo's own testing** -- see the honesty note above. It is also not free and not
+  instant: budget one API call per server scanned.
 - **Palisade does not execute tools.** It reasons about the advertised surface, not runtime
   behaviour. A tool whose description is honest and whose implementation is not will pass.
   Closing that requires a sandboxed dynamic harness, which is the next milestone.
@@ -219,11 +305,15 @@ Worth stating plainly, because a scanner that oversells itself is worse than non
 ## Development
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,semantic]"
 pytest
 ruff check src tests
 python fixtures/generate.py    # rebuild fixtures
 ```
+
+The test suite never calls the real Anthropic API -- `tests/test_semantic.py` drives
+`SemanticJudge` through a fake client, so `pytest` needs no `ANTHROPIC_API_KEY` and costs
+nothing to run.
 
 ## License
 

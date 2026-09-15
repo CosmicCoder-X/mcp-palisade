@@ -6,7 +6,10 @@ import json
 
 from typer.testing import CliRunner
 
+import palisade.cli as cli_module
 from palisade.cli import app
+from palisade.models import Confidence, Evidence, Finding, Severity
+from palisade.rules.semantic import SemanticAnalysisError, SemanticResult
 from tests.conftest import FIXTURES
 
 runner = CliRunner()
@@ -14,6 +17,7 @@ runner = CliRunner()
 BENIGN = str(FIXTURES / "benign.json")
 POISONED = str(FIXTURES / "poisoned.json")
 COLLIDING = str(FIXTURES / "colliding.json")
+PARAPHRASED = str(FIXTURES / "paraphrased.json")
 
 
 class TestExitCodes:
@@ -68,6 +72,84 @@ class TestFormats:
     def test_text_report_quotes_the_decoded_payload(self):
         result = runner.invoke(app, ["scan", POISONED])
         assert "id_rsa" in result.stdout
+
+
+class FakeJudge:
+    """Stands in for SemanticJudge so CLI tests never call the real API."""
+
+    def __init__(self, result=None, error=None, **_kwargs):
+        self._result = result
+        self._error = error
+
+    def analyze(self, surface):
+        if self._error:
+            raise self._error
+        return self._result or SemanticResult(findings=[], summary="clean", model="fake-model")
+
+
+class TestSemanticFlag:
+    def test_disabled_by_default(self, monkeypatch):
+        """Without --semantic, SemanticJudge must never be constructed."""
+
+        def boom(*a, **k):
+            raise AssertionError("SemanticJudge should not be constructed without --semantic")
+
+        monkeypatch.setattr(cli_module, "SemanticJudge", boom)
+        result = runner.invoke(app, ["scan", PARAPHRASED, "--quiet"])
+        assert result.exit_code == 0
+
+    def test_semantic_finding_is_merged_into_the_report(self, monkeypatch):
+        finding = Finding(
+            rule_id="PAL066",
+            title="Semantic judge: content addressed the analyser itself",
+            severity=Severity.CRITICAL,
+            confidence=Confidence.TENTATIVE,
+            subject="tool: export_report",
+            description="Addresses the reviewing model directly.",
+            remediation="Read the quoted text before acting on it.",
+            evidence=[Evidence("description", "already been reviewed and cleared")],
+            tags=["semantic", "meta"],
+        )
+        fake_result = SemanticResult(
+            findings=[finding], summary="one issue", model="fake-model",
+            input_tokens=10, output_tokens=5,
+        )
+        monkeypatch.setattr(
+            cli_module, "SemanticJudge", lambda **k: FakeJudge(result=fake_result)
+        )
+
+        result = runner.invoke(app, ["scan", PARAPHRASED, "--semantic", "--format", "json"])
+        payload = json.loads(result.stdout)
+        findings = payload["servers"][0]["findings"]
+        assert any(f["rule_id"] == "PAL066" for f in findings)
+        assert result.exit_code == 1  # critical severity trips the default --fail-on
+
+    def test_semantic_failure_does_not_abort_the_scan(self, monkeypatch):
+        """A network hiccup in the optional layer must not sink a CI job that
+        only needed the free static results."""
+        monkeypatch.setattr(
+            cli_module,
+            "SemanticJudge",
+            lambda **k: FakeJudge(error=SemanticAnalysisError("no API key configured")),
+        )
+        result = runner.invoke(app, ["scan", BENIGN, "--semantic", "--format", "json"])
+        assert result.exit_code == 0
+        assert "no API key configured" in result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["servers"][0]["summary"]["total_findings"] == 0
+
+    def test_semantic_rules_appear_in_sarif_only_when_flag_is_set(self, monkeypatch):
+        monkeypatch.setattr(cli_module, "SemanticJudge", lambda **k: FakeJudge())
+
+        without = runner.invoke(app, ["scan", BENIGN, "--format", "sarif"])
+        with_flag = runner.invoke(app, ["scan", BENIGN, "--semantic", "--format", "sarif"])
+
+        without_rules = json.loads(without.stdout)["runs"][0]["tool"]["driver"]["rules"]
+        with_rules = json.loads(with_flag.stdout)["runs"][0]["tool"]["driver"]["rules"]
+        without_ids = {r["id"] for r in without_rules}
+        with_ids = {r["id"] for r in with_rules}
+        assert "PAL060" not in without_ids
+        assert "PAL060" in with_ids
 
 
 class TestWorkspace:

@@ -88,7 +88,17 @@ def _result(finding: Finding, artifact_uri: str) -> dict[str, Any]:
     }
 
 
-def build(reports: Sequence[ScanReport], extra: Sequence[Finding] = ()) -> dict[str, Any]:
+def build(
+    reports: Sequence[ScanReport],
+    extra: Sequence[Finding] = (),
+    extra_rule_meta: Sequence[dict[str, Any]] = (),
+) -> dict[str, Any]:
+    """Build a SARIF log.
+
+    ``extra_rule_meta`` lets a caller declare rules that don't live in the
+    static registry -- the semantic judge's PAL06x ids, in particular, which
+    only exist when a scan opted into ``--semantic``.
+    """
     results: list[dict[str, Any]] = []
     for report in reports:
         uri = report.surface.origin or f"mcp://{report.surface.server_id}"
@@ -106,7 +116,7 @@ def build(reports: Sequence[ScanReport], extra: Sequence[Finding] = ()) -> dict[
                         "name": "Palisade",
                         "version": __version__,
                         "informationUri": "https://github.com/CosmicCoder-X/mcp-palisade",
-                        "rules": _rule_metadata(),
+                        "rules": _rule_metadata() + list(extra_rule_meta),
                     }
                 },
                 "results": results,

@@ -24,6 +24,11 @@ def colliding() -> ServerSurface:
     return ServerSurface.load(str(FIXTURES / "colliding.json"))
 
 
+@pytest.fixture
+def paraphrased() -> ServerSurface:
+    return ServerSurface.load(str(FIXTURES / "paraphrased.json"))
+
+
 @pytest.fixture(autouse=True)
 def isolated_pin_store(tmp_path, monkeypatch):
     """Never touch the developer's real pin database during tests."""

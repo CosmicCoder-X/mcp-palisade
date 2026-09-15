@@ -67,6 +67,15 @@ class Engine:
             return False
         return not self.baseline.suppresses(finding)
 
+    def filter_findings(self, findings: list[Finding]) -> list[Finding]:
+        """Apply this engine's severity floor and baseline to findings it didn't produce.
+
+        Lets a caller run findings from outside the rule registry -- the
+        semantic judge, say -- through the same min-severity and baseline
+        policy as everything else, rather than reimplementing it.
+        """
+        return [f for f in findings if self._keep(f)]
+
     def _run(self, rule: Rule, surface: ServerSurface) -> Iterable[Finding]:
         try:
             yield from rule.check(surface)

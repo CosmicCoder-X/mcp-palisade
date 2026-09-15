@@ -22,6 +22,9 @@ from palisade.pinning import PinStore, changed_surface, verify
 from palisade.report import console as console_report
 from palisade.report import sarif as sarif_report
 from palisade.rules import all_rules
+from palisade.rules.semantic import DEFAULT_MODEL as DEFAULT_SEMANTIC_MODEL
+from palisade.rules.semantic import RULE_METADATA as SEMANTIC_RULE_METADATA
+from palisade.rules.semantic import SemanticAnalysisError, SemanticJudge
 
 app = typer.Typer(
     add_completion=False,
@@ -150,6 +153,19 @@ def scan(
     check_pins: bool = typer.Option(
         True, "--check-pins/--no-check-pins", help="Also report drift from a stored pin."
     ),
+    semantic: bool = typer.Option(
+        False,
+        "--semantic",
+        help="Also send the surface to an LLM judge that classifies intent rather "
+        "than matching patterns. Costs money and needs ANTHROPIC_API_KEY -- see "
+        "palisade.rules.semantic.",
+    ),
+    semantic_model: str = typer.Option(
+        DEFAULT_SEMANTIC_MODEL, "--semantic-model", help="Model for --semantic."
+    ),
+    semantic_effort: str | None = typer.Option(
+        None, "--semantic-effort", help="Effort level for --semantic (low..max)."
+    ),
     timeout: float = typer.Option(30.0, "--timeout", help="Per-server capture timeout."),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Summary only."),
 ) -> None:
@@ -176,6 +192,19 @@ def scan(
             delta = engine.scan(changed_surface(pin, report.surface))
             report.findings.extend(verify(pin, report.surface, delta.worst))
 
+    if semantic:
+        judge = SemanticJudge(model=semantic_model, effort=semantic_effort)
+        for report in reports:
+            try:
+                result = judge.analyze(report.surface)
+            except SemanticAnalysisError as exc:
+                err.print(f"[yellow]semantic analysis skipped for "
+                          f"{report.surface.server_id}: {exc}[/yellow]")
+                continue
+            report.findings.extend(engine.filter_findings(result.findings))
+            report.rules_run += len(SEMANTIC_RULE_METADATA)
+            err.print(f"[dim]semantic ({report.surface.server_id}): {result.usage_line()}[/dim]")
+
     threshold = _severity(fail_on)
     worst = max(
         (r.worst for r in reports if r.worst),
@@ -185,7 +214,7 @@ def scan(
     if cross_worst and (not worst or cross_worst.rank > worst.rank):
         worst = cross_worst
 
-    _emit(reports, cross, fmt, output, quiet)
+    _emit(reports, cross, fmt, output, quiet, semantic)
 
     if worst and worst.rank >= threshold.rank:
         raise typer.Exit(EXIT_FINDINGS)
@@ -198,6 +227,7 @@ def _emit(
     fmt: str,
     output: Path | None,
     quiet: bool,
+    semantic: bool = False,
 ) -> None:
     fmt = fmt.lower()
     if fmt == "text":
@@ -216,7 +246,8 @@ def _emit(
             "cross_server_findings": [f.to_dict() for f in cross],
         }
     elif fmt == "sarif":
-        payload = sarif_report.build(reports, cross)
+        extra_meta = SEMANTIC_RULE_METADATA if semantic else ()
+        payload = sarif_report.build(reports, cross, extra_meta)
     else:
         raise typer.BadParameter(f"unknown format {fmt!r}; use text, json or sarif")
 
@@ -346,6 +377,10 @@ def rules() -> None:
         )
     out.print(table)
     out.print(f"[dim]{len(all_rules())} rules[/dim]")
+    out.print(
+        f"[dim]+ {len(SEMANTIC_RULE_METADATA)} semantic rules (PAL06x), opt-in via "
+        f"--semantic, need ANTHROPIC_API_KEY[/dim]"
+    )
 
 
 @app.command()
