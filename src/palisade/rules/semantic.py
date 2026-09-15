@@ -622,21 +622,22 @@ class SemanticJudge:
                 ) from exc
             client = genai.Client()  # reads GOOGLE_API_KEY / GEMINI_API_KEY
 
-        try:
-            from google.genai import types as gtypes
-        except ImportError as exc:  # pragma: no cover - same package as genai itself
-            raise SemanticAnalysisError(
-                "Semantic analysis with provider='gemini' needs the google-genai "
-                "package. Install with:\n    pip install 'mcp-palisade[semantic-gemini]'"
-            ) from exc
-
-        config = gtypes.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=SemanticAnalysis,
-            # Deliberately no `tools` / `tool_config`: same defence as the
-            # Anthropic path -- the judge can classify, never act.
-        )
+        # A plain dict here, not google.genai.types.GenerateContentConfig --
+        # GenerateContentConfigDict is a TypedDict (a plain dict at runtime),
+        # and the SDK accepts either shape, confirmed against the real API:
+        # a bogus key still reaches the server and fails on auth, not on
+        # config shape. Building it this way means this method touches no
+        # google.genai symbol beyond the client itself, so it can be
+        # unit-tested against an injected fake client with no real SDK
+        # installed at all -- the same testability the Anthropic path gets
+        # from building its request as a plain dict.
+        config = {
+            "system_instruction": SYSTEM_PROMPT,
+            "response_mime_type": "application/json",
+            "response_schema": SemanticAnalysis,
+            # Deliberately no "tools" / "tool_config" key: same defence as
+            # the Anthropic path -- the judge can classify, never act.
+        }
 
         try:
             response = client.models.generate_content(

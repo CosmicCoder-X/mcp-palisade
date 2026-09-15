@@ -36,7 +36,11 @@ live = ["mcp>=1.2.0"]
 # split into separate extras so installing one never pulls in the other's SDK.
 semantic = ["anthropic>=0.68.0", "pydantic>=2.0"]
 semantic-gemini = ["google-genai>=1.0.0", "pydantic>=2.0"]
-dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6"]
+# pydantic backs the semantic layer's shared schema (SemanticFinding /
+# SemanticAnalysis) but needs no network access and costs nothing, so tests
+# that exercise that schema and its validation logic belong in dev, not
+# gated behind a paid-API extra the way anthropic/google-genai are.
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6", "pydantic>=2.0"]
 
 [project.scripts]
 palisade = "palisade.cli:app"

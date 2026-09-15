@@ -439,9 +439,9 @@ class TestSemanticJudgeGemini:
         SemanticJudge(provider="gemini", client=client).analyze(surface)
         request = client.models.last_request
         config = request["config"]
-        assert config.tools is None
-        assert config.tool_config is None
-        assert "attacker-controlled text goes here" not in config.system_instruction
+        assert "tools" not in config
+        assert "tool_config" not in config
+        assert "attacker-controlled text goes here" not in config["system_instruction"]
         assert "<mcp_surface_under_review" in request["contents"]
         assert "attacker-controlled text goes here" in request["contents"]
 
